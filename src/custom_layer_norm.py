@@ -1,48 +1,67 @@
 """Implement custom Layer Norm to reduce memory footprint"""
 import time
+import typing
 
 import torch
 
 import torch.nn as nn
 from torch import Tensor, optim
 
+@torch.jit.script
+def backward_helper(
+    dout: Tensor,
+    xmu: Tensor,
+    var: Tensor,
+    x_hat: Tensor,
+    weight: Tensor,
+    eps: Tensor
+) -> typing.Tuple[Tensor, Tensor, Tensor]:
+    """Backpropagation jit script"""
+    batch = dout.shape[0]
+
+    # dalpha and dbeta
+    dbeta = dout.sum(dim=(0, 1))
+    dalpha = (x_hat*dout).sum(dim=(0, 1))
+
+    dx_hat = (dout * weight)
+    inv_var = 1/torch.sqrt(var + eps)
+    dx_hat_sum = dx_hat.sum(dim=-1, keepdim=True)
+
+    # As in https://usmanr149.github.io/urmlblog/cs231n%20assignments/2020/04/03/Batchnorm.html
+    dx = dx_hat*inv_var + (inv_var**3/batch)*(-var**2*dx_hat_sum - xmu*dx_hat_sum*xmu)
+
+    return dx, dalpha, dbeta
+
+@torch.jit.script
+def forward_helper(
+    x: Tensor,
+    weight: Tensor,
+    bias: Tensor,
+    eps: Tensor
+) -> typing.Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Forward propagation jit script"""
+    mean = x.mean(dim=-1, keepdim=True)
+    xmu = (x - mean)
+    var  = (xmu ** 2).mean(dim=-1, keepdim=True)
+    x_hat = xmu / torch.sqrt(var + eps)
+    pred = x_hat*weight + bias
+
+    return xmu, var, x_hat, pred
+
 class LayerNormFunction(torch.autograd.Function):
     """Custom forward pass and backward pass"""
     @staticmethod
-    def forward(ctx, x, weight, bias, elementwise_affine, eps):
+    def forward(ctx, x, weight, bias, eps):
 
-        mean = x.mean(axis=-1, keepdim=True)
-        xmu = (x - mean)
-        var  = (xmu ** 2).mean(axis=-1, keepdim=True)
-        x_hat = xmu / torch.sqrt(var + eps)
-
-        if elementwise_affine:
-            pred = x_hat*weight + bias
-        else:
-            pred = x_hat
-
-        ctx.save_for_backward(xmu, var, weight, x_hat, Tensor([eps]))
+        xmu, var, x_hat, pred = forward_helper(x, weight, bias, eps)
+        ctx.save_for_backward(xmu, var, x_hat, weight, eps)
 
         return pred
 
     @staticmethod
     def backward(ctx, dout):
-        batch, _, _ = dout.shape
-
-        xmu, var, alpha, x_hat, eps = ctx.saved_tensors
-        eps = eps.item()
-
-        # dalpha and dbeta
-        dbeta = dout.sum(axis=(0, 1))
-        dalpha = (x_hat*dout).sum(axis=(0, 1))
-
-        dx_hat = (dout * alpha)
-        inv_var = 1/torch.sqrt(var + eps)
-        dx_hat_sum = dx_hat.sum(axis=-1, keepdim=True)
-
-        # As in https://usmanr149.github.io/urmlblog/cs231n%20assignments/2020/04/03/Batchnorm.html
-        dx = dx_hat*inv_var + (inv_var**3/batch)*(-var**2*dx_hat_sum - xmu*dx_hat_sum*xmu)
-
+        xmu, var, x_hat, weight, eps = ctx.saved_tensors
+        dx, dalpha, dbeta = backward_helper(dout, xmu, var, x_hat, weight, eps)
         return dx, dalpha, dbeta, None, None
 
 class CustomLayerNorm(nn.LayerNorm):
@@ -52,7 +71,6 @@ class CustomLayerNorm(nn.LayerNorm):
         self,
         normalized_shape,
         eps=1e-05,
-        elementwise_affine=True,
         # TODO: solve argument issue
         # device=None,
         # dtype=None
@@ -60,14 +78,14 @@ class CustomLayerNorm(nn.LayerNorm):
         super(CustomLayerNorm, self).__init__(
             normalized_shape,
             eps=eps,
-            elementwise_affine=elementwise_affine,
+            elementwise_affine=True,
             # TODO: solve argument issue
             # device=device,
             # dtype=dtype
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        return LayerNormFunction.apply(x, self.weight, self.bias, self.elementwise_affine, self.eps)
+        return LayerNormFunction.apply(x, self.weight, self.bias, Tensor([self.eps]))
 
 def custom_train(norm, input_x, target_y, criterion, optimizer, epochs=10000):
     """Custom train with backprop"""
