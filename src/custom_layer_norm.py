@@ -7,30 +7,38 @@ import torch
 import torch.nn as nn
 from torch import Tensor, optim
 
+"""
+# TODO: Problems:
+1) This implementation is slower than PyTorch's
+2) We should not save pred in the context
+3) It is probably necessary to add an eps when dividing by var
+4) More checks are needed to avoid any silent errors
+"""
+
 @torch.jit.script
 def backward_helper(
     dout: Tensor,
-    xmu: Tensor,
     var: Tensor,
-    x_hat: Tensor,
     weight: Tensor,
-    eps: Tensor
+    bias: Tensor,
+    pred: Tensor
 ) -> typing.Tuple[Tensor, Tensor, Tensor]:
     """Backpropagation jit script"""
-    batch = dout.shape[0]
+    x_hat = (pred - bias) / weight
+    dx_hat = x_hat*var
+    dx_hat_sum = dx_hat.sum(dim=-1, keepdim=True)
+
+    # As in https://www.deepspeed.ai/news/2020/05/27/fastest-bert-training.html
+    H = dout.shape[2]
+    A = -dx_hat_sum/(2*var**3)
+    M = 2*A/H + (dx_hat/var)
+    K = -torch.mean(M, dim=-1, keepdim=True)
 
     # dalpha and dbeta
     dbeta = dout.sum(dim=(0, 1))
     dalpha = (x_hat*dout).sum(dim=(0, 1))
 
-    dx_hat = (dout * weight)
-    inv_var = 1/torch.sqrt(var + eps)
-    dx_hat_sum = dx_hat.sum(dim=-1, keepdim=True)
-
-    # As in https://usmanr149.github.io/urmlblog/cs231n%20assignments/2020/04/03/Batchnorm.html
-    dx = dx_hat*inv_var + (inv_var**3/batch)*(-var**2*dx_hat_sum - xmu*dx_hat_sum*xmu)
-
-    return dx, dalpha, dbeta
+    return M + K, dalpha, dbeta
 
 @torch.jit.script
 def forward_helper(
@@ -38,7 +46,7 @@ def forward_helper(
     weight: Tensor,
     bias: Tensor,
     eps: Tensor
-) -> typing.Tuple[Tensor, Tensor, Tensor, Tensor]:
+) -> typing.Tuple[Tensor, Tensor]:
     """Forward propagation jit script"""
     mean = x.mean(dim=-1, keepdim=True)
     xmu = (x - mean)
@@ -46,22 +54,23 @@ def forward_helper(
     x_hat = xmu / torch.sqrt(var + eps)
     pred = x_hat*weight + bias
 
-    return xmu, var, x_hat, pred
+    return var, pred
 
 class LayerNormFunction(torch.autograd.Function):
     """Custom forward pass and backward pass"""
     @staticmethod
     def forward(ctx, x, weight, bias, eps):
+        var, pred = forward_helper(x, weight, bias, eps)
 
-        xmu, var, x_hat, pred = forward_helper(x, weight, bias, eps)
-        ctx.save_for_backward(xmu, var, x_hat, weight, eps)
+        # DeepSpeed stores weight, bias, var, and "pred"
+        ctx.save_for_backward(var, weight, bias, pred)
 
         return pred
 
     @staticmethod
     def backward(ctx, dout):
-        xmu, var, x_hat, weight, eps = ctx.saved_tensors
-        dx, dalpha, dbeta = backward_helper(dout, xmu, var, x_hat, weight, eps)
+        var, weight, bias, pred = ctx.saved_tensors
+        dx, dalpha, dbeta = backward_helper(dout, var, weight, bias, pred)
         return dx, dalpha, dbeta, None, None
 
 class CustomLayerNorm(nn.LayerNorm):
