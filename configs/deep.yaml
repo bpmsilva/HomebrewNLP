@@ -1,15 +1,26 @@
 model:
-  depth: 256
+  steps_per_checkpoint: 32
+  offloading: true
+  print_on_init: false
+  depth: 128
   conv_kernel_size: 11
   weight_shared_blocks: 1
-  batch_size: 4
+  batch_size: 1
   feed_forward_intermediate_factor: 0.125
+  features: 512
+  moe:
+    use_in_input: false
+    use_in_output: true
+    num_experts: 128
 optimizer:
+  beta2: 0.95
   gradient_accumulation_steps: 1
   one_cycle:
     cycle_first_step_size: 8192
-    cycle_second_step_size: 4096
-    cycle_max_lr: 0.002
-    cycle_min_mom: 0.7
+    cycle_second_step_size: null
+    cycle_min_lr: 0.0001
+    cycle_max_lr: 0.001
+    cycle_min_mom: 0.6
+    cycle_max_mom: 0.9
 log:
-  print_interval: 64
+    loss_steps_per_print: 1

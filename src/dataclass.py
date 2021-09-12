@@ -1,7 +1,8 @@
-import torch
-import typing
-import yaml
 import pathlib
+import typing
+
+import torch
+import yaml
 
 
 class DataClass:
@@ -24,6 +25,9 @@ class MoE(DataClass):
 
 
 class Model(DataClass):
+    checkpoint_path: str = "checkpoint.torch"
+    steps_per_checkpoint: int = 0  # 0 -> disabled
+    print_on_init: bool = True
     features: int = 256
     momentumnet_beta: float = 0.99  # The higher this is, the more numerically stable. BUT also lower impact per layer
     depth: int = 64
@@ -39,22 +43,27 @@ class Model(DataClass):
     dropout_probability: float = 0.
     bottleneck_group = 1  # not all group counts are possible. it has to be divide self.features without residual
     moe: MoE = MoE()
-
-
-class Log(DataClass):
-    deepspeed_steps_per_print: int = 2 ** 20
-    wall_clock_breakdown: bool = False
-    dump_state: bool = False
-    loss_steps_per_print: int = 32
+    offloading: bool = False
 
 
 class Dataset(DataClass):
     file_name: str = "out.tensor"
     classes: int = 256
-    shuffle: bool = False
     num_workers: int = 4
     pin_memory: bool = False
-    prefetch_factor: int = 2
+    prefetch_factor: int = 256  # 256 (Prefetch) * 8 (Long) * 2048 (GPT context) * 256 (High Batch) = 1GiB RAM
+
+
+class WandB(DataClass):
+    project: str = 'gpt'
+    entity: str = 'homebrewnlp'
+    model_log_type: typing.Optional[str] = None  # One of "gradients", "parameters", "all", or None
+    log_frequency: int = 1000  # log gradients and parameters every N batches
+
+
+class Log(DataClass):
+    loss_steps_per_print: int = 32  # 0 -> off
+    wandb: WandB = WandB()
 
 
 class Offload(DataClass):
@@ -90,19 +99,45 @@ class OneCycle(DataClass):
     last_batch_iteration: int = -1  # The index of the last batch. This parameter is used when resuming a training job.
 
 
+class AdaptiveGradientClipping(DataClass):
+    gradient_clipping: float = 0.01
+    zero_division_eps: float = 1e-6
+    eps: float = 1e-3
+
+
+class SharpnessAwareMinimization(DataClass):
+    enabled: bool = True
+    step_size: bool = 0.05
+    adaptive: bool = True
+
+
 class Optimizer(DataClass):
-    type: str = "AdamW"
+    type: str = "adamw"
     gradient_accumulation_steps: int = 1
     one_cycle: OneCycle = OneCycle()
-    beta2: float = 0.9999  # beta1 is controlled by one_cycle
-    epsilon: float = 1e-8
+    beta2: float = 0.95  # beta1 is controlled by one_cycle
+    eps: float = 1e-8
     weight_decay: float = 0.01
-    gradient_clipping: float = 1.
     zero: Zero = Zero()
+    agc = AdaptiveGradientClipping()
+    sharpness_aware_minimization: SharpnessAwareMinimization = SharpnessAwareMinimization()
+
+    # Shampoo hyper-params
+    diagonal_eps: float = 1e-6
+    matrix_eps: float = 1e-12
+    inverse_exponent_override: int = 0
+    start_preconditioning_step: int = 16
+    preconditioning_compute_steps: int = 1
+    statistics_compute_steps: int = 1
+    block_size: int = 128
+    best_effort_shape_interpretation: bool = True
+    graft_type: str = 'adagrad'  # 'Adagrad' or 'SGD'
+    nesterov: bool = True
+    no_preconditioning_for_layers_with_dim_gt: int = 8192
 
 
 class Eval(DataClass):
-    cache: bool = True
+    cache: bool = False
 
 
 def init_class(instance: DataClass, config: typing.Dict[str, typing.Any]):
@@ -124,10 +159,10 @@ class Context(DataClass):
         self.dataset = Dataset()
         self.model = Model()
         self.eval = Eval()
+        self.wandb = WandB()
 
         if config_path is not None:
-            cfg = config_path.read_text()
-            init_class(self, yaml.safe_load(cfg))
+            config = yaml.safe_load(config_path.read_text())
 
         if config is not None:
-            self.__dict__.update(config)
+            init_class(self, config)
