@@ -2,43 +2,46 @@
 import time
 import typing
 
+from copy import deepcopy
+
 import torch
 
 import torch.nn as nn
 from torch import Tensor, optim
 
 """
-# TODO: Problems:
-1) This implementation is slower than PyTorch's
-2) We should not save pred in the context
-3) It is probably necessary to add an eps when dividing by var
-4) More checks are needed to avoid any silent errors
+# TODO:
+1) Do more checks to avoid any silent errors
+2) Compute backprop as in DeepSpeed in attempt to reduce memory consumption and enhance speed
 """
-
 @torch.jit.script
 def backward_helper(
     dout: Tensor,
     var: Tensor,
     weight: Tensor,
     bias: Tensor,
-    pred: Tensor
+    pred: Tensor,
+    eps: Tensor
 ) -> typing.Tuple[Tensor, Tensor, Tensor]:
     """Backpropagation jit script"""
-    x_hat = (pred - bias) / weight
-    dx_hat = x_hat*var
-    dx_hat_sum = dx_hat.sum(dim=-1, keepdim=True)
+    features = dout.shape[-1]
 
-    # As in https://www.deepspeed.ai/news/2020/05/27/fastest-bert-training.html
-    H = dout.shape[2]
-    A = -dx_hat_sum/(2*var**3)
-    M = 2*A/H + (dx_hat/var)
-    K = -torch.mean(M, dim=-1, keepdim=True)
+    x_hat = (pred - bias)/weight
+    xmu = x_hat*torch.sqrt(var + eps)
+    dx_hat = dout * weight
 
     # dalpha and dbeta
     dbeta = dout.sum(dim=(0, 1))
-    dalpha = (x_hat*dout).sum(dim=(0, 1))
+    dalpha = (dout * x_hat).sum(dim=(0, 1))
 
-    return M + K, dalpha, dbeta
+    # As in https://www.deepspeed.ai/news/2020/05/27/fastest-bert-training.html
+    # and https://usmanr149.github.io/urmlblog/cs231n%20assignments/2020/04/03/Batchnorm.html
+    inv_std = 1/torch.sqrt(var + eps)
+    dx = dx_hat*inv_std - \
+        (inv_std**3/features) * \
+        (var*dx_hat.sum(dim=-1, keepdim=True) + xmu*((dx_hat*xmu).sum(dim=-1, keepdim=True)))
+
+    return dx, dalpha, dbeta
 
 @torch.jit.script
 def forward_helper(
@@ -52,7 +55,9 @@ def forward_helper(
     xmu = (x - mean)
     var  = (xmu ** 2).mean(dim=-1, keepdim=True)
     x_hat = xmu / torch.sqrt(var + eps)
-    pred = x_hat*weight + bias
+
+    # TODO: add elementwise_affine
+    pred = weight*x_hat + bias
 
     return var, pred
 
@@ -62,15 +67,15 @@ class LayerNormFunction(torch.autograd.Function):
     def forward(ctx, x, weight, bias, eps):
         var, pred = forward_helper(x, weight, bias, eps)
 
-        # DeepSpeed stores weight, bias, var, and "pred"
-        ctx.save_for_backward(var, weight, bias, pred)
+        # DeepSpeed stores var, weight, bias, and pred
+        ctx.save_for_backward(var, weight, bias, pred, eps)
 
         return pred
 
     @staticmethod
     def backward(ctx, dout):
-        var, weight, bias, pred = ctx.saved_tensors
-        dx, dalpha, dbeta = backward_helper(dout, var, weight, bias, pred)
+        var, weight, bias, pred, eps = ctx.saved_tensors
+        dx, dalpha, dbeta = backward_helper(dout, var, weight, bias, pred, eps)
         return dx, dalpha, dbeta, None, None
 
 class CustomLayerNorm(nn.LayerNorm):
@@ -96,7 +101,22 @@ class CustomLayerNorm(nn.LayerNorm):
     def forward(self, x: Tensor) -> Tensor:
         return LayerNormFunction.apply(x, self.weight, self.bias, Tensor([self.eps]))
 
-def custom_train(norm, input_x, target_y, criterion, optimizer, epochs=10000):
+class CustomNN(nn.Module):
+    """Simple linear layer with layer norm for debugging purposes"""
+    # TODO: add elementwise_affine and set its default value to False
+    def __init__(self, embed_size, custom_layer_norm, eps=1e-5):
+        super(CustomNN, self).__init__()
+        self.linear_layer = nn.Linear(embed_size, embed_size)
+        if not custom_layer_norm:
+            self.layer_norm = nn.LayerNorm(embed_size, eps=eps)
+        else:
+            self.layer_norm = CustomLayerNorm(embed_size, eps=eps)
+
+    def forward(self, x):
+        """ Feedforward function """
+        return self.layer_norm(self.linear_layer(x))
+
+def custom_train(norm, input_x, target_y, criterion, optimizer, epochs=1000):
     """Custom train with backprop"""
     print('\nCustom train:')
     for epoch in range(1, epochs + 1):
@@ -117,22 +137,23 @@ def main():
     input_x  = torch.randn(batch, sequence, features, requires_grad=True)
     target_y = torch.randn(batch, sequence, features, requires_grad=True)
 
-    # # Activating the module 1
-    original_ln = nn.LayerNorm(features)
+    # Activating the module 1
+    original_ln = CustomNN(features, custom_layer_norm=False)
     output1 = original_ln(input_x)
     loss1 = (output1 - target_y).pow(2).sum()
     loss1.backward()
 
-    print(output1[0, 0, 0])
+    print(output1[0:5, 0, 0])
     print(loss1)
 
-    # # Activating the module 2
-    custom_ln = CustomLayerNorm(features)
+    # Activating the module 2
+    custom_ln = CustomNN(features, custom_layer_norm=True)
+    custom_ln.linear_layer = deepcopy(original_ln.linear_layer)
     output2 = custom_ln(input_x)
     loss2 = (output2 - target_y).pow(2).sum()
     loss2.backward()
 
-    print(output2[0, 0, 0])
+    print(output2[0:5, 0, 0])
     print(loss2)
 
     if train:
