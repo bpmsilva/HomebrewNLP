@@ -84,33 +84,31 @@ class CustomLayerNorm(nn.LayerNorm):
     def __init__(
         self,
         normalized_shape,
+        device,
         eps=1e-05,
-        # TODO: solve argument issue
-        # device=None,
-        # dtype=None
     ):
         super(CustomLayerNorm, self).__init__(
             normalized_shape,
-            eps=eps,
             elementwise_affine=True,
-            # TODO: solve argument issue
-            # device=device,
-            # dtype=dtype
+            device=device,
+            eps=eps
         )
 
+        self.device = device
+
     def forward(self, x: Tensor) -> Tensor:
-        return LayerNormFunction.apply(x, self.weight, self.bias, Tensor([self.eps]))
+        return LayerNormFunction.apply(x, self.weight, self.bias, Tensor([self.eps]).to(self.device))
 
 class CustomNN(nn.Module):
     """Simple linear layer with layer norm for debugging purposes"""
     # TODO: add elementwise_affine and set its default value to False
-    def __init__(self, embed_size, custom_layer_norm, eps=1e-5):
+    def __init__(self, embed_size, custom_layer_norm, device, eps=1e-5):
         super(CustomNN, self).__init__()
-        self.linear_layer = nn.Linear(embed_size, embed_size)
+        self.linear_layer = nn.Linear(embed_size, embed_size, device=device)
         if not custom_layer_norm:
-            self.layer_norm = nn.LayerNorm(embed_size, eps=eps)
+            self.layer_norm = nn.LayerNorm(embed_size, device=device, eps=eps)
         else:
-            self.layer_norm = CustomLayerNorm(embed_size, eps=eps)
+            self.layer_norm = CustomLayerNorm(embed_size, device=device, eps=eps)
 
     def forward(self, x):
         """ Feedforward function """
@@ -132,13 +130,15 @@ def main():
     """Main function"""
     train = True
     torch.manual_seed(0)
+    use_cuda = True
+    device = torch.device('cuda' if torch.cuda.is_available() and use_cuda else 'cpu')
 
     batch, sequence, features = 16, 64, 128
-    input_x  = torch.randn(batch, sequence, features, requires_grad=True)
-    target_y = torch.randn(batch, sequence, features, requires_grad=True)
+    input_x  = torch.randn(batch, sequence, features, requires_grad=True).to(device)
+    target_y = torch.randn(batch, sequence, features, requires_grad=True).to(device)
 
     # Activating the module 1
-    original_ln = CustomNN(features, custom_layer_norm=False)
+    original_ln = CustomNN(features, custom_layer_norm=False, device=device)
     output1 = original_ln(input_x)
     loss1 = (output1 - target_y).pow(2).sum()
     loss1.backward()
@@ -147,7 +147,7 @@ def main():
     print(loss1)
 
     # Activating the module 2
-    custom_ln = CustomNN(features, custom_layer_norm=True)
+    custom_ln = CustomNN(features, custom_layer_norm=True, device=device)
     custom_ln.linear_layer = deepcopy(original_ln.linear_layer)
     output2 = custom_ln(input_x)
     loss2 = (output2 - target_y).pow(2).sum()
