@@ -14,8 +14,42 @@ from torch import Tensor, optim
 1) Do more checks to avoid any silent errors
 2) Compute backprop as in DeepSpeed in attempt to reduce memory consumption and enhance speed
 """
+class AffineLayerNormFunction(torch.autograd.Function):
+    """Custom forward pass and backward pass"""
+    @staticmethod
+    def forward(ctx, x, weight, bias, eps):
+        var, pred = affine_forward_helper(x, weight, bias, eps)
+
+        # DeepSpeed stores var, weight, bias, and pred
+        ctx.save_for_backward(var, weight, bias, pred, eps)
+
+        return pred
+
+    @staticmethod
+    def backward(ctx, dout):
+        var, weight, bias, pred, eps = ctx.saved_tensors
+        dx, dalpha, dbeta = affine_backward_helper(dout, var, weight, bias, pred, eps)
+        return dx, dalpha, dbeta, None
+
 @torch.jit.script
-def backward_helper(
+def affine_forward_helper(
+    x: Tensor,
+    weight: Tensor,
+    bias: Tensor,
+    eps: Tensor
+) -> typing.Tuple[Tensor, Tensor]:
+    """Forward propagation jit script"""
+    mean = x.mean(dim=-1, keepdim=True)
+    xmu = (x - mean)
+    var = (xmu ** 2).mean(dim=-1, keepdim=True)
+    x_hat = xmu / torch.sqrt(var + eps)
+
+    pred = weight*x_hat + bias
+
+    return var, pred
+
+@torch.jit.script
+def affine_backward_helper(
     dout: Tensor,
     var: Tensor,
     weight: Tensor,
@@ -43,40 +77,53 @@ def backward_helper(
 
     return dx, dalpha, dbeta
 
-@torch.jit.script
-def forward_helper(
-    x: Tensor,
-    weight: Tensor,
-    bias: Tensor,
-    eps: Tensor
-) -> typing.Tuple[Tensor, Tensor]:
-    """Forward propagation jit script"""
-    mean = x.mean(dim=-1, keepdim=True)
-    xmu = (x - mean)
-    var  = (xmu ** 2).mean(dim=-1, keepdim=True)
-    x_hat = xmu / torch.sqrt(var + eps)
-
-    # TODO: add elementwise_affine
-    pred = weight*x_hat + bias
-
-    return var, pred
-
 class LayerNormFunction(torch.autograd.Function):
     """Custom forward pass and backward pass"""
     @staticmethod
-    def forward(ctx, x, weight, bias, eps):
-        var, pred = forward_helper(x, weight, bias, eps)
-
-        # DeepSpeed stores var, weight, bias, and pred
-        ctx.save_for_backward(var, weight, bias, pred, eps)
+    def forward(ctx, x, eps):
+        var, pred = forward_helper(x, eps)
+        ctx.save_for_backward(var, pred, eps)
 
         return pred
 
     @staticmethod
     def backward(ctx, dout):
-        var, weight, bias, pred, eps = ctx.saved_tensors
-        dx, dalpha, dbeta = backward_helper(dout, var, weight, bias, pred, eps)
-        return dx, dalpha, dbeta, None, None
+        var, pred, eps = ctx.saved_tensors
+        dx = backward_helper(dout, var, pred, eps)
+        return dx, None, None
+
+@torch.jit.script
+def forward_helper(
+    x: Tensor,
+    eps: Tensor
+) -> typing.Tuple[Tensor, Tensor]:
+    """Forward propagation jit script"""
+    mean = x.mean(dim=-1, keepdim=True)
+    xmu = (x - mean)
+    var = (xmu ** 2).mean(dim=-1, keepdim=True)
+    x_hat = xmu / torch.sqrt(var + eps)
+
+    return var, x_hat
+
+@torch.jit.script
+def backward_helper(
+    dout: Tensor,
+    var: Tensor,
+    pred: Tensor,
+    eps: Tensor
+) -> Tensor:
+    """Backpropagation jit script"""
+    features = dout.shape[-1]
+
+    # As in https://www.deepspeed.ai/news/2020/05/27/fastest-bert-training.html
+    # and https://usmanr149.github.io/urmlblog/cs231n%20assignments/2020/04/03/Batchnorm.html
+    xmu = pred*torch.sqrt(var + eps)
+    inv_std = 1/torch.sqrt(var + eps)
+    dx = dout*inv_std - \
+        (inv_std**3/features) * \
+        (var*dout.sum(dim=-1, keepdim=True) + xmu*((dout*xmu).sum(dim=-1, keepdim=True)))
+
+    return dx
 
 class CustomLayerNorm(nn.LayerNorm):
     """Custom Layer Norm to reduce memory footprint"""
@@ -84,12 +131,13 @@ class CustomLayerNorm(nn.LayerNorm):
     def __init__(
         self,
         normalized_shape,
+        elementwise_affine,
         device,
         eps=1e-05,
     ):
         super(CustomLayerNorm, self).__init__(
             normalized_shape,
-            elementwise_affine=True,
+            elementwise_affine=elementwise_affine,
             device=device,
             eps=eps
         )
@@ -97,18 +145,23 @@ class CustomLayerNorm(nn.LayerNorm):
         self.device = device
 
     def forward(self, x: Tensor) -> Tensor:
-        return LayerNormFunction.apply(x, self.weight, self.bias, Tensor([self.eps]).to(self.device))
+        if not self.elementwise_affine:
+            return LayerNormFunction.apply(x, Tensor([self.eps]).to(self.device))
+        else:
+            return AffineLayerNormFunction.apply(
+                x, self.weight, self.bias, Tensor([self.eps]).to(self.device))
 
 class CustomNN(nn.Module):
     """Simple linear layer with layer norm for debugging purposes"""
-    # TODO: add elementwise_affine and set its default value to False
-    def __init__(self, embed_size, custom_layer_norm, device, eps=1e-5):
+    def __init__(self, embed_size, custom_layer_norm, elementwise_affine, device, eps=1e-5):
         super(CustomNN, self).__init__()
         self.linear_layer = nn.Linear(embed_size, embed_size, device=device)
         if not custom_layer_norm:
-            self.layer_norm = nn.LayerNorm(embed_size, device=device, eps=eps)
+            self.layer_norm = nn.LayerNorm(
+                embed_size, elementwise_affine=elementwise_affine, device=device, eps=eps)
         else:
-            self.layer_norm = CustomLayerNorm(embed_size, device=device, eps=eps)
+            self.layer_norm = CustomLayerNorm(
+                embed_size, elementwise_affine=elementwise_affine, device=device, eps=eps)
 
     def forward(self, x):
         """ Feedforward function """
@@ -138,7 +191,7 @@ def main():
     target_y = torch.randn(batch, sequence, features, requires_grad=True).to(device)
 
     # Activating the module 1
-    original_ln = CustomNN(features, custom_layer_norm=False, device=device)
+    original_ln = CustomNN(features, custom_layer_norm=False, elementwise_affine=True, device=device)
     output1 = original_ln(input_x)
     loss1 = (output1 - target_y).pow(2).sum()
     loss1.backward()
@@ -147,7 +200,7 @@ def main():
     print(loss1)
 
     # Activating the module 2
-    custom_ln = CustomNN(features, custom_layer_norm=True, device=device)
+    custom_ln = CustomNN(features, custom_layer_norm=True, elementwise_affine=True, device=device)
     custom_ln.linear_layer = deepcopy(original_ln.linear_layer)
     output2 = custom_ln(input_x)
     loss2 = (output2 - target_y).pow(2).sum()
